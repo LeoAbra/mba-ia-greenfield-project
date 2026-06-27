@@ -24,6 +24,10 @@ export function createTestDataSource(
 }
 
 export async function cleanAllTables(dataSource: DataSource): Promise<void> {
+  // Order matters — delete child rows before the rows they reference so the
+  // foreign keys never block a delete. videos → channels → users, and the
+  // token tables → users. The videos table always exists in the shared test DB.
+  await dataSource.query('DELETE FROM "videos"');
   await dataSource.query('DELETE FROM "refresh_tokens"');
   await dataSource.query('DELETE FROM "verification_tokens"');
   await dataSource.query('DELETE FROM "channels"');
