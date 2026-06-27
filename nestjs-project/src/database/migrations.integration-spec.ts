@@ -37,6 +37,13 @@ describe('Database migrations (integration)', () => {
       ),
       dataSource.query(`DROP TABLE IF EXISTS "migrations" CASCADE`),
     ]);
+
+    // CreateAuthTokens creates this enum type, and dropping the tables above
+    // does not remove it. Drop it too so the migration's `CREATE TYPE` is not
+    // blocked when the suite runs against an already-migrated database.
+    await dataSource.query(
+      `DROP TYPE IF EXISTS "verification_tokens_type_enum" CASCADE`,
+    );
   });
 
   afterAll(async () => {

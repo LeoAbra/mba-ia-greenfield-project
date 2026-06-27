@@ -34,6 +34,9 @@ docker compose exec nestjs-api npm run start:dev
 Services:
 - `nestjs-api` — NestJS API, port `3000`
 - `db` — PostgreSQL 17, port `5432`, database `streamtube`, user/password `streamtube`
+- `minio` — S3-compatible object storage, API port `9000`, console `9001` (video files + thumbnails)
+- `redis` — Redis 7, port `6379` (BullMQ queue backend)
+- `video-worker` — FFmpeg processing worker; consumes the `video-processing` queue. Like `nestjs-api` it boots with `tail -f /dev/null`; start it manually with `docker compose exec video-worker npm run worker:dev`.
 
 All verification and teardown commands run on the **host machine**:
 
@@ -62,6 +65,9 @@ docker compose down
 npm run start:dev                        # Dev server with hot-reload
 npm run build                            # Compile to dist/
 npm run start:prod                       # Run compiled build
+
+npm run worker:dev                       # Video processing worker (watch)  — run in the video-worker container
+npm run worker:prod                      # Video processing worker (compiled) — run in the video-worker container
 
 npm test                                 # Unit tests
 npm run test:watch                       # Unit tests in watch mode
@@ -121,6 +127,8 @@ These settings are required in `package.json` (jest config) and `test/jest-e2e.j
 
 - `setupFiles: ["dotenv/config"]` — without this, `.env` is not loaded inside the Jest process. `DB_HOST`, `JWT_SECRET`, etc. fall back to undefined or to the host's `localhost`, breaking container-to-container DNS.
 - `testRegex: '.*\\.(spec|integration-spec)\\.ts$'` — covers both unit (`*.spec.ts`) and integration (`*.integration-spec.ts`) suffixes.
+- `forceExit: true` — integration suites open real Redis/MinIO/Postgres connections; some libraries keep sockets alive briefly after teardown. Without `forceExit`, Jest hangs after the run completes, and **a Jest process killed via a host-side timeout keeps running inside the container, holding DB/Redis connections** (pool exhaustion + orphaned rows on the next run). Keep teardown correct (`app.close()` / `dataSource.destroy()` / `moduleRef.close()`); `forceExit` is the safety net.
+- `testTimeout: 30000` — on Windows Docker Desktop the bind-mounted `node_modules` makes cold `ts-jest` compilation + `TypeOrmModule.forRoot(synchronize)` startup exceed Jest's 5s default hook timeout. The higher value covers cold starts; it does not slow passing tests.
 
 Do not add new test-file suffixes; if a new test type is needed, update the regex deliberately.
 
@@ -149,12 +157,34 @@ NestJS with standard module structure. Source lives in `src/`, compiled output i
 - Each domain feature gets its own module (e.g., `UsersModule`, `VideosModule`) registered in `AppModule`
 - Controllers handle HTTP routing; Services hold business logic; both are scoped to their module
 
+## Videos Module (Phase 03 — Upload & Processing)
+
+`src/videos/` owns the video lifecycle; `src/storage/` wraps object storage; `src/worker.ts` + `src/worker.module.ts` boot the processing worker. A video belongs to a `Channel` (`@ManyToOne` FK on the `videos` table; the relation is one-directional — `Channel` has no back-reference).
+
+**Endpoints** (`VideosController`, all under `/videos`):
+
+| Method & path | Auth | Purpose |
+|---|---|---|
+| `POST /videos` | Bearer | Pre-register the video as `draft` and start a multipart upload; returns `{ videoId, uploadId, partSize, partCount }`. **No file bytes pass through the API.** |
+| `GET /videos/:publicId/upload-url?partNumber=N` | Bearer, owner | Presigned URL the client uses to `PUT` one part **directly to storage**. |
+| `POST /videos/:publicId/complete` | Bearer, owner | Finalize the multipart upload, move `draft → processing`, enqueue the processing job. |
+| `GET /videos/:publicId` | Public | Public metadata + status. |
+| `GET /videos/:publicId/stream` | Public | Range streaming — `206 Partial Content` when a `Range` header is sent, else `200`. |
+| `GET /videos/:publicId/download` | Public | Original file as an attachment. |
+| `GET /videos/:publicId/thumbnail` | Public | Generated JPEG thumbnail. |
+
+- **Upload (10GB-safe):** presigned multipart (AWS SDK v3 against MinIO, `forcePathStyle`). The client uploads parts straight to storage; the API only handles small JSON. See `StorageService`.
+- **Queue & worker:** the API enqueues to the BullMQ `video-processing` queue (Redis); the separate `video-worker` container (`Dockerfile.worker`, FFmpeg) consumes it. `VideoProcessor` extracts duration/metadata (`ffprobe`) and generates the thumbnail (`ffmpeg`), then sets `ready`. Job options: 3 attempts, exponential backoff; idempotent (skips when already `ready`); `error` is set only after the final attempt.
+- **Storage keys:** `videos/{videoId}/original/{filename}` and `videos/{videoId}/thumbnail.jpg` in the private `streamtube-videos` bucket. Delivery endpoints range-proxy bytes through the API, so storage credentials never reach the client.
+- **Status lifecycle:** `draft → processing → ready | error`, persisted on the `videos` table.
+- **Unique URL:** `public_id` = `crypto.randomBytes(8).toString('base64url')` (11 chars), unique index, collision-safe save-retry on PG `23505`.
+
 ## Code Conventions
 
 - **TypeScript:** `nodenext` module resolution, `ES2023` target, `strictNullChecks` on, `noImplicitAny` off
 - **Decorators:** `emitDecoratorMetadata` + `experimentalDecorators` enabled — required for NestJS DI
 - **Prettier:** single quotes, trailing commas everywhere
-- **ESLint:** `no-explicit-any` allowed; `no-floating-promises` and `no-unsafe-argument` are warnings
+- **ESLint:** `no-explicit-any` allowed; `no-floating-promises` and `no-unsafe-argument` are warnings. Test files (`*.spec.ts`, `*-spec.ts`, `*.e2e-spec.ts`, `src/test/**`) have an override turning off the type-checked `no-unsafe-*` family / `unbound-method` / `require-await` (idiomatic in mocks and supertest `res.body`); production code keeps the full strict ruleset
 
 ## REST Conventions
 
